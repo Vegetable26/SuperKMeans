@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <omp.h>
 #include <random>
+#include <ruy/ruy.h>
 
 #include "superkmeans/common.h"
 #include "superkmeans/distance_computers/base_computers.h"
@@ -47,12 +48,55 @@ struct SuperKMeansConfig {
 
     // Output parameters
     bool unrotate_centroids = true; // Whether to unrotate centroids before returning
-    bool verbose = false;           // Whether to print progress information
+    bool verbose = true;           // Whether to print progress information
     bool angular = false;           // Whether to use spherical k-means
     bool suppress_warnings = false; // Whether to suppress warnings
 
     bool data_already_rotated = false; // Whether input data is already rotated (skip rotation)
 };
+
+// JOJO3: use a different max on avx. In general copy this from PDXearch
+uint8_t MAX_VALUE = 255;
+
+// Copied from PDXearch... 
+void QuantizeEmbedding(
+    const float *embedding, 
+    const size_t num_dimensions,
+    const float quantization_base, 
+    const float quantization_scale,
+    uint8_t *output_quantized_embedding) {
+    for (size_t i = 0; i < num_dimensions; ++i) {
+        const int rounded = static_cast<int>(std::round((embedding[i] - quantization_base) * quantization_scale));
+        if (rounded > MAX_VALUE) {
+            output_quantized_embedding[i] = MAX_VALUE;
+        } else if (rounded < 0) {
+            output_quantized_embedding[i] = 0;
+        } else {
+            // std::cout << "Quantizing embedding " << embedding[i] << " to " << rounded << " given base=" << quantization_base << " and scale=" << quantization_scale << std::endl;
+            output_quantized_embedding[i] = static_cast<uint8_t>(rounded);
+        }
+    }
+}
+
+void QuantizeEmbeddings(
+    const float *embeddings, 
+    const size_t total_elements,
+    const size_t num_dimensions,
+    uint8_t *output_quantized_embeddings) {
+
+    float global_min = std::numeric_limits<float>::max();
+    float global_max = std::numeric_limits<float>::lowest();
+    for (size_t i = 0; i < total_elements * num_dimensions; ++i) {
+        global_min = std::min(global_min, embeddings[i]);
+        global_max = std::max(global_max, embeddings[i]);
+    }
+    const float range = global_max - global_min;
+    float scaling_factor = (range > 0) ? static_cast<float>(MAX_VALUE) / range : 1.0f;
+
+    for (size_t i = 0; i < total_elements; ++i) {
+        QuantizeEmbedding(&embeddings[i * num_dimensions], num_dimensions,global_min, scaling_factor, &output_quantized_embeddings[i * num_dimensions]);
+    }
+}
 
 /**
  * @brief Statistics for a single iteration of SuperKMeans clustering.
@@ -97,20 +141,26 @@ struct ClusterBalanceStats {
     }
 };
 
-template <Quantization q = Quantization::f32, DistanceFunction alpha = DistanceFunction::l2>
+template <
+    Quantization in_d = Quantization::f32,
+    DistanceFunction alpha = DistanceFunction::l2,
+    // TODO: Swap this to the true quantized type
+    Quantization q = Quantization::u8>
 class SuperKMeans {
   public:
     virtual ~SuperKMeans() = default;
 
   protected:
-    using centroid_value_t = skmeans_centroid_value_t<q>;
-    using vector_value_t = skmeans_value_t<q>;
-    using pruner_t = ADSamplingPruner<q>;
-    using layout_t = PDXLayout<q, alpha>;
-    using distance_t = skmeans_distance_t<q>;
+    using centroid_value_t = skmeans_centroid_value_t<in_d>;
+    using vector_value_t = skmeans_value_t<in_d>;
+    using distance_t = skmeans_distance_t<in_d>;
+
+
+    using pruner_t = ADSamplingPruner<in_d>;
+    using layout_t = PDXLayout<in_d, alpha>;
     using MatrixR = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
     using VectorR = Eigen::VectorXf;
-    using batch_computer = BatchComputer<alpha, q>;
+    using batch_computer = BatchComputer<alpha, in_d>;
 
   public:
     /**
@@ -157,9 +207,9 @@ class SuperKMeans {
      * @param n_queries Number of query vectors (ignored if queries is nullptr and sample_queries is
      * false)
      *
-     * @return std::vector<skmeans_centroid_value_t<q>> Trained centroids
+     * @return std::vector<skmeans_centroid_value_t<in_d>> Trained centroids
      */
-    std::vector<skmeans_centroid_value_t<q>> Train(
+    std::vector<skmeans_centroid_value_t<in_d>> Train(
         const vector_value_t* SKM_RESTRICT data,
         const size_t n,
         const vector_value_t* SKM_RESTRICT queries = nullptr,
@@ -205,7 +255,7 @@ class SuperKMeans {
         not_pruned_counts.reserve(n_samples);
         std::vector<distance_t> tmp_distances_buf;
         tmp_distances_buf.reserve(X_BATCH_SIZE * Y_BATCH_SIZE);
-        vertical_d = PDXLayout<q, alpha>::GetDimensionSplit(d).vertical_d;
+        vertical_d = PDXLayout<in_d, alpha>::GetDimensionSplit(d).vertical_d;
         partial_horizontal_centroids.reset(new centroid_value_t[n_clusters * vertical_d]);
 
         // Set partial_d (d') dynamically as half of vertical_d (around 12% of d)
@@ -223,13 +273,34 @@ class SuperKMeans {
         if (config.verbose) {
             std::cout << "Sampling data..." << std::endl;
         }
+        std::cout << "Using " << n_samples << " vectors out of " << n << " for clustering" << std::endl;
 
         std::vector<vector_value_t> data_samples_buffer;
         data_samples_buffer.reserve(n_samples * d);
+        // JOJO2: WE DO NOT USE ALL VECTORS FOR THE CLUSTERING... 
+        // TODO: What are the tradeoffs... 
+        std::cout << "Sampling and rotate data to index. Samples=" << n_samples << std::endl;
         auto data_to_cluster = SampleAndRotateVectors(
             data_p, data_samples_buffer.data(), n, n_samples, !config.data_already_rotated
         );
 
+        // BuildResultSet() in pdxearch does scaling... 
+        std::cout << "Quantizing data to index" << std::endl;
+        
+        std::vector<uint8_t> data_to_cluster_quantized_buffer;
+        data_to_cluster_quantized_buffer.reserve(n_samples * d);
+        QuantizeEmbeddings(data_to_cluster, n_samples, d, data_to_cluster_quantized_buffer.data());
+
+        std::cout << "Quantized data" << std::endl;
+
+        std::cout << "Multiplying matrix" << std::endl;
+
+        ruy::Matrix<uint8_t> lhs;
+        ruy::MakeSimpleLayout(n_samples, d, ruy::Order::kRowMajor, lhs.mutable_layout());
+        lhs.set_data(data_to_cluster_quantized_buffer.data());
+        std::cout << lhs.layout().rows() << " x " << lhs.layout().cols() << std::endl;
+
+        std::cout << "Sampling and rotate centroids" << n_clusters << std::endl;
         RotateOrCopy(
             horizontal_centroids.get(),
             prev_centroids.get(),
@@ -280,12 +351,15 @@ class SuperKMeans {
         size_t iters_without_improvement = 0;
 
         for (size_t iter_idx = 0; iter_idx < config.iters; ++iter_idx) {
+            /*
             bool use_gemm_only = (iter_idx == 0) || always_gemm_only;
             if (!use_gemm_only && !partial_norms_computed) {
                 GetPartialL2NormsRowMajor(data_to_cluster, n_samples, data_norms.get(), partial_d);
                 partial_norms_computed = true;
             }
-            if (use_gemm_only) {
+            */
+            // if (use_gemm_only) {
+            // JOJO4: Use a pure GEMM solution for now...
                 RunIteration<true>(
                     data_to_cluster,
                     tmp_distances_buf.data(),
@@ -300,6 +374,7 @@ class SuperKMeans {
                     iter_idx == 0,
                     iteration_stats
                 );
+            /*
             } else {
                 RunIteration<false>(
                     data_to_cluster,
@@ -316,6 +391,7 @@ class SuperKMeans {
                     iteration_stats
                 );
             }
+            */
             if (config.early_termination &&
                 ShouldStopEarly(n_queries > 0, best_recall, iters_without_improvement, iter_idx)) {
                 break;
@@ -441,7 +517,7 @@ class SuperKMeans {
 
         // Consolidate was called at the end of RunIteration<true>, so we don't need to call it here
         // All the centroid-related pointers are updated with the final centroids
-        auto pdx_centroids = PDXLayout<q, alpha>(
+        auto pdx_centroids = PDXLayout<in_d, alpha>(
             this->centroids.get(), *pruner, n_clusters, d, partial_horizontal_centroids.get()
         );
 
@@ -775,6 +851,8 @@ class SuperKMeans {
      * @param iter_idx Current iteration index (0-based)
      * @param is_first_iter Whether this is the first iteration (skips centroid swap)
      */
+    
+
     template <bool GEMM_ONLY>
     void RunIteration(
         const vector_value_t* SKM_RESTRICT data_to_cluster,
@@ -952,7 +1030,7 @@ class SuperKMeans {
         {
             SKM_PROFILE_SCOPE("consolidate/pdxify");
             //! This updates the object within the pdx_layout wrapper
-            PDXLayout<q, alpha>::template PDXify<false>(
+            PDXLayout<in_d, alpha>::template PDXify<false>(
                 horizontal_centroids.get(), centroids.get(), n_clusters, d
             );
             CentroidsToAuxiliaryHorizontal(n_clusters);
@@ -1089,7 +1167,7 @@ class SuperKMeans {
      * @param rotate Wheter to rotate the sampled centroids
      * @return PDXLayout wrapper for the centroids
      */
-    PDXLayout<q, alpha> GenerateCentroids(
+    PDXLayout<in_d, alpha> GenerateCentroids(
         const vector_value_t* SKM_RESTRICT data,
         const size_t n_points,
         const size_t n_clusters,
@@ -1119,7 +1197,7 @@ class SuperKMeans {
         RotateOrCopy(horizontal_centroids.get(), rotated_centroids.data(), n_clusters, rotate);
         {
             SKM_PROFILE_SCOPE("consolidate/pdxify");
-            PDXLayout<q, alpha>::template PDXify<false>(
+            PDXLayout<in_d, alpha>::template PDXify<false>(
                 rotated_centroids.data(), centroids.get(), n_clusters, d
             );
         }
@@ -1127,7 +1205,7 @@ class SuperKMeans {
         //! Any updates to these objects is reflected in the PDXLayout
         //! partial_horizontal_centroids are not filled until ConsolidateCentroids is called()
         // after the first iteration
-        auto pdx_centroids = PDXLayout<q, alpha>(
+        auto pdx_centroids = PDXLayout<in_d, alpha>(
             centroids.get(), *pruner, n_clusters, d, partial_horizontal_centroids.get()
         );
         return pdx_centroids;
@@ -1178,10 +1256,13 @@ class SuperKMeans {
         const size_t n_vectors,
         const bool rotate
     ) {
+        std::cout << "Rotating " << n_vectors << " points" << std::endl;
         SKM_PROFILE_SCOPE("rotator");
         if (rotate) { // NOLINT(bugprone-branch-clone)
+            std::cout << "Rotating with ADSampling" << std::endl;
             pruner->Rotate(in, out, n_vectors);
         } else {
+            std::cout << "Just memcpy" << std::endl;
             memcpy(
                 static_cast<void*>(out),
                 static_cast<const void*>(in),

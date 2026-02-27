@@ -55,8 +55,10 @@ class ADSamplingPruner {
         // x86 machines don't behave well with FFTW with non-power-of-2 dimensions
         if (num_dimensions >= D_THRESHOLD_FOR_DCT_ROTATION && IsPowerOf2(num_dimensions)) {
 #else
+        std::cout << "No AVX2 - no need for power of 2" << std::endl;
         if (num_dimensions >= D_THRESHOLD_FOR_DCT_ROTATION) {
 #endif
+            std::cout << "Using DCT rotation" << std::endl;
             fftwf_init_threads();
             matrix.resize(1, num_dimensions);
             std::uniform_int_distribution<int> dist(0, 1);
@@ -73,6 +75,7 @@ class ADSamplingPruner {
         }
 #endif
         if (!matrix_created) {
+            std::cout << "Using orthonormal - gaussian matrix rotation ... we don't have FFT" << std::endl;
             matrix.resize(num_dimensions, num_dimensions);
             std::normal_distribution<float> dist(0.0f, 1.0f);
             for (uint32_t i = 0; i < num_dimensions; ++i) {

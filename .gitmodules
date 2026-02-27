@@ -4,3 +4,6 @@
 [submodule "extern/findFFTW"]
 	path = extern/findFFTW
 	url = https://github.com/egpbos/findFFTW.git
+[submodule "extern/ruy"]
+	path = extern/ruy
+	url = https://github.com/google/ruy.git

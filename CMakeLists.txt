@@ -70,7 +70,12 @@ else()
 endif()
 
 add_compile_definitions(CMAKE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-include_directories(include extern/Eigen)
+include_directories(include extern/Eigen extern/ruy)
+
+# RUY GEMM library (cpuinfo's clog requires old CMake policy compat)
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+add_subdirectory(extern/ruy EXCLUDE_FROM_ALL)
+unset(CMAKE_POLICY_VERSION_MINIMUM CACHE)
 
 if(SKMEANS_COMPILE_TESTS)
     enable_testing()
