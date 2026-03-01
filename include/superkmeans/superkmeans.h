@@ -323,6 +323,12 @@ class SuperKMeans {
             std::cout << "Centroids to explore: " << centroids_to_explore << " ("
                 << config.ann_explore_fraction * 100.0f << "% of " << n_clusters << ")"
                 << std::endl;
+
+            if (centroids_to_explore > 5) {
+                std::cout << "JOJO reducing centroids to explore to 5" << std::endl;
+                centroids_to_explore = 5;
+            }
+
             {
                 SKM_PROFILE_SCOPE("allocator");
                 gt_assignments.reset(new uint32_t[n_queries * config.objective_k]);
@@ -897,7 +903,6 @@ class SuperKMeans {
         // The quantized centroids are only needed for this loop
         // std::cout << "Quantizing centroids in inner loop" << std::endl;
         QuantizeEmbeddings(prev_centroids.get(), n_clusters, d, quantized_centroids.data());
-
         
         std::unique_ptr<vector_value_t[]> quantized_data_norms(new vector_value_t[n_samples]);
         std::unique_ptr<vector_value_t[]> quantized_centroid_norms(new vector_value_t[n_clusters]);

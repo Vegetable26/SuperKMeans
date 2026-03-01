@@ -1,6 +1,7 @@
 set(EXAMPLES_COMMON_LIBS
     ${MKL_COMMON_LIBS}
     ${BLAS_LINK_LIBRARIES}
+    ruy
 )
 
 if (FFTW_FOUND)

@@ -44,7 +44,7 @@ int main(int argc, char* argv[]) {
     skmeans::TicToc timer;
     timer.Tic();
     // 100 random queries with K=10 for K-ANN
-    std::vector<float> centroids = kmeans.Train(data.data(), n, nullptr, 100);
+    std::vector<float> centroids = kmeans.Train(data.data(), n, nullptr, 500);
     timer.Toc();
 
     double construction_time_ms = timer.GetMilliseconds();
