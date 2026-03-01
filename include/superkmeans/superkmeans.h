@@ -36,8 +36,8 @@ struct SuperKMeansConfig {
     float tol = 1e-4f;                  // Tolerance for shift-based early termination
     float recall_tol = 0.005f;          // Tolerance for recall-based early termination
     bool early_termination = true;      // Whether to stop early on convergence
-    bool sample_queries = false;        // Whether to sample queries from data
-    size_t objective_k = 100;           // Number of nearest neighbors for recall computation
+    bool sample_queries = true;        // Whether to sample queries from data
+    size_t objective_k = 10;           // Number of nearest neighbors for recall computation
     float ann_explore_fraction = 0.01f; // Fraction of centroids to explore (0.0 to 1.0)
 
     // Sweet range for d' tuning
@@ -55,10 +55,10 @@ struct SuperKMeansConfig {
     bool data_already_rotated = false; // Whether input data is already rotated (skip rotation)
 };
 
-// JOJO3: use a different max on avx. In general copy this from PDXearch
-uint8_t MAX_VALUE = 255;
+// HACKY IMPLEMENTATION: 
 
 // Copied from PDXearch... 
+uint8_t MAX_VALUE = 255;
 void QuantizeEmbedding(
     const float *embedding, 
     const size_t num_dimensions,
@@ -155,6 +155,10 @@ class SuperKMeans {
     using vector_value_t = skmeans_value_t<in_d>;
     using distance_t = skmeans_distance_t<in_d>;
 
+    using q_centroid_value_t = skmeans_centroid_value_t<q>;
+    using q_vector_value_t = skmeans_value_t<q>;
+    using q_distance_t = skmeans_distance_t<q>;
+    using q_batch_computer = BatchComputer<alpha, q>;
 
     using pruner_t = ADSamplingPruner<in_d>;
     using layout_t = PDXLayout<in_d, alpha>;
@@ -315,11 +319,10 @@ class SuperKMeans {
         if (n_queries) {
             centroids_to_explore =
                 std::max<size_t>(static_cast<size_t>(n_clusters * config.ann_explore_fraction), 1);
-            if (config.verbose) {
-                std::cout << "Centroids to explore: " << centroids_to_explore << " ("
-                          << config.ann_explore_fraction * 100.0f << "% of " << n_clusters << ")"
-                          << std::endl;
-            }
+
+            std::cout << "Centroids to explore: " << centroids_to_explore << " ("
+                << config.ann_explore_fraction * 100.0f << "% of " << n_clusters << ")"
+                << std::endl;
             {
                 SKM_PROFILE_SCOPE("allocator");
                 gt_assignments.reset(new uint32_t[n_queries * config.objective_k]);
@@ -341,7 +344,11 @@ class SuperKMeans {
                 );
             }
             GetL2NormsRowMajor(rotated_queries.data(), n_queries, query_norms.get());
+
+            std::cout << "JOJO getting ground-truth assignments for recall " << n_queries << std::endl;
             GetGTAssignmentsAndDistances(data_to_cluster, rotated_queries.data(), n_queries);
+        } else {
+            std::cout <<"JOJO not enabled with recall queries" << std::endl;
         }
 
         bool always_gemm_only = d < DIMENSION_THRESHOLD_FOR_PRUNING || config.use_blas_only ||
@@ -372,7 +379,11 @@ class SuperKMeans {
                     n_clusters,
                     iter_idx,
                     iter_idx == 0,
-                    iteration_stats
+                    iteration_stats,
+                    // Quantized data and quantized centroids... 
+                    data_to_cluster_quantized_buffer.data()
+                    // TODO: Quantized centroids here... 
+                    //data_to_cluster_quantized_buffer.data()
                 );
             /*
             } else {
@@ -440,6 +451,8 @@ class SuperKMeans {
         Eigen::Map<VectorR> c_norms(centroid_norms_local.data(), n_centroids);
         c_norms.noalias() = centroids_mat.rowwise().squaredNorm();
 
+        assert(false);
+        /*
         batch_computer::FindNearestNeighbor(
             vectors,
             centroids,
@@ -452,6 +465,7 @@ class SuperKMeans {
             result_distances.data(),
             tmp_distances_buf.data()
         );
+        */
 
         return result_assignments;
     }
@@ -866,13 +880,101 @@ class SuperKMeans {
         const size_t n_clusters,
         size_t& iter_idx,
         const bool is_first_iter,
-        std::vector<SuperKMeansIterationStats>& target_stats
+        std::vector<SuperKMeansIterationStats>& target_stats,
+
+        // TODO: SKM_RESTRICT is not technically true any more ... IN the case that q == in_d 
+        const q_vector_value_t* SKM_RESTRICT quantized_data_to_cluster
+        // const q_centroid_value_t* SKM_RESTRICT quantized_centroids
     ) {
         if (!is_first_iter) {
             std::swap(horizontal_centroids, prev_centroids);
+        }       
+        
+        // prev_centroids are the current ones to iterate on... 
+        std::vector<uint8_t> quantized_centroids;
+        quantized_centroids.reserve(n_clusters * d);
+
+        // The quantized centroids are only needed for this loop
+        // std::cout << "Quantizing centroids in inner loop" << std::endl;
+        QuantizeEmbeddings(prev_centroids.get(), n_clusters, d, quantized_centroids.data());
+
+        
+        std::unique_ptr<vector_value_t[]> quantized_data_norms(new vector_value_t[n_samples]);
+        std::unique_ptr<vector_value_t[]> quantized_centroid_norms(new vector_value_t[n_clusters]);
+
+        // TODO: JOJO final point
+
+        GetL2NormsRowMajor(quantized_data_to_cluster, n_samples, quantized_data_norms.get());
+        GetL2NormsRowMajor(quantized_centroids.data(), n_clusters, quantized_centroid_norms.get());
+
+        // TODO: Pass quantized centroids in next
+
+        // Debug: print original and quantized input/centroid matrices
+        /*
+        {
+            std::cout << "=== Original input (float, " << n_samples << " rows, " << d << " dims) ===\n";
+            for (size_t i = 0; i < n_samples; ++i) {
+                for (size_t j = 0; j < d; ++j)
+                    std::cout << data_to_cluster[i * d + j] << " ";
+                std::cout << "\n";
+            }
+            std::cout << "=== Quantized input (uint8, " << n_samples << " rows, " << d << " dims) ===\n";
+            for (size_t i = 0; i < n_samples; ++i) {
+                for (size_t j = 0; j < d; ++j)
+                    std::cout << static_cast<int>(quantized_data_to_cluster[i * d + j]) << " ";
+                std::cout << "\n";
+            }
+            std::cout << "=== Original centroids (float, " << n_clusters << " rows, " << d << " dims) ===\n";
+            for (size_t i = 0; i < n_clusters; ++i) {
+                for (size_t j = 0; j < d; ++j)
+                    std::cout << prev_centroids.get()[i * d + j] << " ";
+                std::cout << "\n";
+            }
+            std::cout << "=== Quantized centroids (uint8, " << n_clusters << " rows, " << d << " dims) ===\n";
+            for (size_t i = 0; i < n_clusters; ++i) {
+                for (size_t j = 0; j < d; ++j)
+                    std::cout << static_cast<int>(quantized_centroids[i * d + j]) << " ";
+                std::cout << "\n";
+            }
+        }
+        */
+
+        // This is FirstAssignAndUpdateCentroids() ... 
+        {
+            batch_computer::FindNearestNeighbor(
+                quantized_data_to_cluster,
+                quantized_centroids.data(),
+                n_samples,
+                n_clusters,
+                d,
+                quantized_data_norms.get(),
+                quantized_centroid_norms.get(),
+                assignments.get(),
+                distances.get(),
+                tmp_distances_buf
+                // quantized_centroids
+            );
+
+            // Debug: print distances
+            // TODO: this is my favorite...
+            /*
+            std::cout << "=== Distances (point -> centroid, dist) ===\n";
+            for (size_t i = 0; i < n_samples; ++i) {
+                std::cout << "point[" << i << "] -> centroid[" << assignments.get()[i] << "]  dist=" << distances.get()[i] << "\n";
+            }
+            */
+
+            {
+                SKM_PROFILE_SCOPE("fill");
+                std::fill(
+                    horizontal_centroids.get(), horizontal_centroids.get() + (n_clusters * d), 0.0
+                );
+                std::fill(cluster_sizes.get(), cluster_sizes.get() + n_clusters, 0);
+            }
         }
 
-        if constexpr (GEMM_ONLY) {
+        // TODO: Figure out plan for prev_centroids... 
+        /*
             GetL2NormsRowMajor(prev_centroids.get(), n_clusters, centroid_norms.get());
             FirstAssignAndUpdateCentroids(
                 data_to_cluster, prev_centroids.get(), tmp_distances_buf, n_samples, n_clusters
@@ -896,7 +998,9 @@ class SuperKMeans {
                 n_clusters
             );
         }
+        */
 
+        // TODO: COme back and check if this is correct... 
         UpdateCentroids(data_to_cluster, n_samples, n_clusters);
 
         float avg_not_pruned_pct = -1.0f;
@@ -912,9 +1016,21 @@ class SuperKMeans {
 
         ConsolidateCentroids(n_samples, n_clusters);
 
+        /*
+        {
+            std::cout << "=== New centroids (float, " << n_clusters << " rows, " << d << " dims) ===\n";
+            for (size_t i = 0; i < n_clusters; ++i) {
+                for (size_t j = 0; j < d; ++j)
+                    std::cout << horizontal_centroids.get()[i * d + j] << " ";
+                std::cout << "\n";
+            }
+        }
+        */
+
         ComputeCost(n_samples);
         ComputeShift(n_clusters);
 
+        std::cout << "JOJO computing recall with n queries=" << n_queries << std::endl;
         if (n_queries) {
             GetL2NormsRowMajor(horizontal_centroids.get(), n_clusters, centroid_norms.get());
             recall = ComputeRecall(rotated_queries, n_queries);
@@ -1113,6 +1229,8 @@ class SuperKMeans {
      */
     float ComputeRecall(const vector_value_t* SKM_RESTRICT queries, const size_t n_queries) {
         SKM_PROFILE_SCOPE("recall");
+        // TODO:JOJO final change....
+
         batch_computer::FindKNearestNeighbors(
             queries,
             horizontal_centroids.get(),
@@ -1126,20 +1244,24 @@ class SuperKMeans {
             recall_distances.get(),
             tmp_distances_buffer.get()
         );
+
         // For each query, compute recall@objective_k: how many of the GT clusters are found in the
         // top-%centroids_to_explore assignments
         // Recall per query = (# matched GT assignments in top-%centroids_to_explore) / objective_k
         // Final recall = average over all queries
+
         float sum_recall = 0.0f;
         for (size_t i = 0; i < n_queries; ++i) {
             size_t found_in_query = 0;
             // For each GT assignment for query q
             for (size_t j = 0; j < config.objective_k; ++j) {
                 uint32_t gt = gt_assignments[i * config.objective_k + j]; // gt is a vector index
+
                 // Check if this GT assignment is present in the top-%centroids_to_explore
                 // assignments for this query
                 bool found = false;
                 for (size_t t = 0; t < centroids_to_explore; ++t) {
+
                     // If a centroid is the same as the GT centroid assignment, then we have a match
                     if (promising_centroids[i * centroids_to_explore + t] == assignments[gt]) {
                         found = true;
@@ -1238,6 +1360,23 @@ class SuperKMeans {
         Eigen::Map<const MatrixR> e_data(data, n, d);
         Eigen::Map<VectorR> e_norms(out_norm, n);
         e_norms.noalias() = e_data.rowwise().squaredNorm();
+    }
+
+    void GetL2NormsRowMajor(
+        const q_vector_value_t* SKM_RESTRICT data,
+        const size_t n,
+        vector_value_t* SKM_RESTRICT out_norm
+    ) {
+        SKM_PROFILE_SCOPE("norms_calc");
+        for (size_t i = 0; i < n; ++i) {
+            const q_vector_value_t* row = data + i * d;
+            int32_t acc = 0;
+#pragma clang loop vectorize(enable)
+            for (size_t j = 0; j < d; ++j) {
+                acc += static_cast<int32_t>(row[j]) * static_cast<int32_t>(row[j]);
+            }
+            out_norm[i] = static_cast<vector_value_t>(acc);
+        }
     }
 
     /**

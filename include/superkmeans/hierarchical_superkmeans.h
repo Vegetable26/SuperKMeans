@@ -216,6 +216,7 @@ class HierarchicalSuperKMeans : public SuperKMeans<q, alpha> {
                 );
                 partial_norms_computed = true;
             }
+            /*
             if (use_gemm_only) {
                 this->template RunIteration<true>(
                     data_to_cluster,
@@ -247,6 +248,7 @@ class HierarchicalSuperKMeans : public SuperKMeans<q, alpha> {
                     this->hierarchical_iteration_stats.mesoclustering_iteration_stats
                 );
             }
+            */
             if (this->hierarchical_config.early_termination &&
                 this->ShouldStopEarly(false, best_recall, iters_without_improvement, iter_idx)) {
                 break;
@@ -361,6 +363,7 @@ class HierarchicalSuperKMeans : public SuperKMeans<q, alpha> {
                     );
                     fine_partial_norms_computed = true;
                 }
+                /*
                 if (use_gemm_only) {
                     this->template RunIteration<true>(
                         mesocluster_data_to_cluster,
@@ -392,6 +395,7 @@ class HierarchicalSuperKMeans : public SuperKMeans<q, alpha> {
                         this->hierarchical_iteration_stats.fineclustering_iteration_stats
                     );
                 }
+                */
                 if (this->hierarchical_config.early_termination &&
                     this->ShouldStopEarly(
                         false, fine_best_recall, iters_without_improvement, fine_iter_idx
@@ -478,6 +482,7 @@ class HierarchicalSuperKMeans : public SuperKMeans<q, alpha> {
                 );
                 refinement_partial_norms_computed = true;
             }
+            /*
             if (refinement_always_gemm_only) {
                 this->template RunIteration<true>(
                     data_to_cluster,
@@ -509,6 +514,7 @@ class HierarchicalSuperKMeans : public SuperKMeans<q, alpha> {
                     this->hierarchical_iteration_stats.refinement_iteration_stats
                 );
             }
+            */
         }
         timer_refinement.Toc();
 

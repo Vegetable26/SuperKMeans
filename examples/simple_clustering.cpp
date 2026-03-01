@@ -43,7 +43,8 @@ int main(int argc, char* argv[]) {
     std::cout << "Running SuperKMeans with " << k << " clusters..." << std::endl;
     skmeans::TicToc timer;
     timer.Tic();
-    std::vector<float> centroids = kmeans.Train(data.data(), n);
+    // 100 random queries with K=10 for K-ANN
+    std::vector<float> centroids = kmeans.Train(data.data(), n, nullptr, 100);
     timer.Toc();
 
     double construction_time_ms = timer.GetMilliseconds();

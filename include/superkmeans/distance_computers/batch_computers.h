@@ -10,25 +10,27 @@
 #include "superkmeans/profiler.h"
 #include <Eigen/Dense>
 
+
 // Eigen already declares sgemm_, so we don't need to redeclare it
 // TODO(lkuffo, low): However, I would like to have more control over this
 extern "C" {
-/* declare BLAS functions, see http://www.netlib.org/clapack/cblas/ */
-// int sgemm_(
-//         const char* transa,
-//         const char* transb,
-//         FINTEGER* m,
-//         FINTEGER* n,
-//         FINTEGER* k,
-//         const float* alpha,
-//         const float* a,
-//         FINTEGER* lda,
-//         const float* b,
-//         FINTEGER* ldb,
-//         float* beta,
-//         float* c,
-//         FINTEGER* ldc);
-}
+    /* declare BLAS functions, see http://www.netlib.org/clapack/cblas/ */
+    // int sgemm_(
+    //         const char* transa,
+    //         const char* transb,
+    //         FINTEGER* m,
+    //         FINTEGER* n,
+    //         FINTEGER* k,
+    //         const float* alpha,
+    //         const float* a,
+    //         FINTEGER* lda,
+    //         const float* b,
+    //         FINTEGER* ldb,
+    //         float* beta,
+    //         float* c,
+    //         FINTEGER* ldc);
+    }
+#include <ruy/ruy.h>
 
 namespace skmeans {
 
@@ -102,6 +104,72 @@ class BatchComputer<DistanceFunction::l2, Quantization::f32> {
         );
     }
 
+    using q_data_t = skmeans_value_t<Quantization::u8>;
+    static void uint8_t_BlasMatrixMultiplication(
+        const q_data_t* SKM_RESTRICT batch_x_p,
+        const q_data_t* SKM_RESTRICT batch_y_p,
+        const size_t batch_n_x,
+        const size_t batch_n_y,
+        const size_t d,
+        const size_t partial_d,
+        float* SKM_RESTRICT tmp_distances_buf
+    ) {
+        const int k = static_cast<int>(partial_d > 0 && partial_d < d ? partial_d : d);
+        const int nx = static_cast<int>(batch_n_x);
+        const int ny = static_cast<int>(batch_n_y);
+
+        // LHS: X as (batch_n_x × k) row-major with stride=d (rows spaced d elements apart
+        // even when k < d, matching the partial_d BLAS ldb=d convention).
+        ruy::Matrix<uint8_t> lhs;
+        ruy::MakeSimpleLayout(nx, k, ruy::Order::kRowMajor, lhs.mutable_layout());
+        lhs.mutable_layout()->set_stride(static_cast<int>(d));
+        lhs.set_data(batch_x_p);
+
+        // RHS: Y^T — Y is (batch_n_y × d) row-major. Reinterpreting as (k × batch_n_y)
+        // col-major with stride=d gives Y^T: element (i,j) is at offset j*d+i = Y[j,i].
+        ruy::Matrix<uint8_t> rhs;
+        ruy::MakeSimpleLayout(k, ny, ruy::Order::kColMajor, rhs.mutable_layout());
+        rhs.mutable_layout()->set_stride(static_cast<int>(d));
+        rhs.set_data(batch_y_p);
+
+        // ruy cannot write uint8*uint8 dot products directly to float (MulParams requires
+        // AccumScalar and DstScalar to share floating/integral kind). We collect raw int32
+        // accumulators and then widen to float below.
+        std::vector<int32_t> int32_buf(nx * ny);
+        ruy::Matrix<int32_t> dst;
+        ruy::MakeSimpleLayout(nx, ny, ruy::Order::kRowMajor, dst.mutable_layout());
+        dst.set_data(int32_buf.data());
+
+        ruy::MulParams<int32_t, int32_t> mul_params;
+        thread_local ruy::Context context;
+        ruy::Mul(lhs, rhs, mul_params, &context, &dst);
+
+        // Debug: print both vectors and dot-product for every (query, centroid) pair
+        /*
+        for (int i = 0; i < nx; ++i) {
+            for (int j = 0; j < ny; ++j) {
+                std::cout << "q[" << i << "] x c[" << j << "]  dot=" << int32_buf[i * ny + j] << "\n";
+                std::cout << "  query:    ";
+                for (int l = 0; l < k; ++l)
+                    std::cout << static_cast<int>(batch_x_p[i * d + l]) << " ";
+                std::cout << "\n";
+                std::cout << "  centroid: ";
+                for (int l = 0; l < k; ++l)
+                    std::cout << static_cast<int>(batch_y_p[j * d + l]) << " ";
+                std::cout << "\n";
+            }
+        }
+        */
+
+        // Cast int32 → float in-place into the caller's buffer.
+        const int32_t* src = int32_buf.data();
+        const size_t total = static_cast<size_t>(nx) * static_cast<size_t>(ny);
+#pragma clang loop vectorize(enable)
+        for (size_t i = 0; i < total; ++i) {
+            tmp_distances_buf[i] = static_cast<float>(src[i]);
+        }
+    }
+
   public:
     /**
      * @brief Finds the top-1 nearest neighbor for each query vector.
@@ -121,9 +189,10 @@ class BatchComputer<DistanceFunction::l2, Quantization::f32> {
      * @param tmp_distances_buf Buffer for batch distance computation (size: X_BATCH_SIZE ×
      * Y_BATCH_SIZE)
      */
+
     static void FindNearestNeighbor(
-        const data_t* SKM_RESTRICT x,
-        const data_t* SKM_RESTRICT y,
+        const q_data_t* SKM_RESTRICT x,
+        const q_data_t* SKM_RESTRICT y,
         const size_t n_x,
         const size_t n_y,
         const size_t d,
@@ -154,7 +223,7 @@ class BatchComputer<DistanceFunction::l2, Quantization::f32> {
 #pragma omp parallel for num_threads(g_n_threads) schedule(static)
                 for (size_t r = 0; r < batch_n_x; r += MINI_BATCH_SIZE) {
                     auto mini_batch_n_x = std::min(MINI_BATCH_SIZE, batch_n_x - r);
-                    BlasMatrixMultiplication(
+                    uint8_t_BlasMatrixMultiplication(
                         batch_x_p + r * d,
                         batch_y_p,
                         mini_batch_n_x,
@@ -165,24 +234,33 @@ class BatchComputer<DistanceFunction::l2, Quantization::f32> {
                     );
                 }
 #else
-                BlasMatrixMultiplication(
+                uint8_t_BlasMatrixMultiplication(
                     batch_x_p, batch_y_p, batch_n_x, batch_n_y, d, 0, tmp_distances_buf
                 );
 #endif
+
+                std::cout << "JOJO computing distances" << std::endl;
+                // Reinterprets the flat buffer tmp_distances_buf as a matrix of x by y ... 
                 Eigen::Map<MatrixR> distances_matrix(tmp_distances_buf, batch_n_x, batch_n_y);
-#pragma omp parallel for num_threads(g_n_threads)
+// #pragma omp parallel for num_threads(g_n_threads)
+                // Loop over batch_x and batch_y ... X is the number of input vectors .... 
                 for (size_t r = 0; r < batch_n_x; ++r) {
                     const auto i_idx = i + r;
                     const float norm_x_i = norms_x[i_idx];
                     float* row_p = distances_matrix.data() + r * batch_n_y;
 #pragma clang loop vectorize(enable)
+                    // This is the summed values.... of everything
                     for (size_t c = 0; c < batch_n_y; ++c) {
                         row_p[c] = -2.0f * row_p[c] + norm_x_i + norms_y[j + c];
                     }
                     uint32_t knn_idx;
                     auto batch_top_1 = distances_matrix.row(r).minCoeff(&knn_idx);
+                    assert(batch_top_1 >= 0.0f);
+                    assert(batch_top_1 <= std::numeric_limits<distance_t>::max());
                     if (batch_top_1 < out_distances[i_idx]) {
+                        //
                         out_distances[i_idx] = std::max(0.0f, batch_top_1);
+                       // std::cout << "JOJO out_distances[i_idx]=" << out_distances[i_idx] << " for point " << r << " but batch is " << batch_top_1 << std::endl;
                         out_knn[i_idx] = j + knn_idx;
                     }
                 }
